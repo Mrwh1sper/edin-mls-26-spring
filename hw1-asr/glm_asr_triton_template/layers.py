@@ -158,7 +158,10 @@ def gelu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     sqrt_2_over_pi = 0.7978845608028654
     x3 = x * x * x
     inner = sqrt_2_over_pi * (x + 0.044715 * x3)
-    y = 0.5 * x * (1.0 + tl.libdevice.tanh(inner))
+    #y = 0.5 * x * (1.0 + tl.libdevice.tanh(inner))
+
+    tanh_inner = 2.0 * tl.sigmoid(2.0 * inner) - 1.0
+    y = x * 0.5 * (1.0 + tanh_inner)
 
     tl.store(y_ptr + offs, y, mask=mask)
     #pass
@@ -301,7 +304,10 @@ def linear_gelu_kernel(
     sqrt_2_over_pi = 0.7978845608028654
     acc3 = acc * acc * acc
     inner = sqrt_2_over_pi * (acc + 0.044715 * acc3)
-    acc = acc * 0.5 * (1.0 + tl.libdevice.tanh(inner))
+    #acc = acc * 0.5 * (1.0 + tl.libdevice.tanh(inner))
+    inner = sqrt_2_over_pi * (acc + 0.044715 * acc3)
+    tanh_inner = 2.0 * tl.sigmoid(2.0 * inner) - 1.0
+    acc = acc * 0.5 * (1.0 + tanh_inner)
 
     tl.store(
         c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
@@ -964,7 +970,8 @@ class MLP:
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_gating and MLP.FUSED and x.is_cuda:
-            return self._forward_fused(x)
+            #return self._forward_fused(x)
+            return self._forward_standard(x)
         return self._forward_standard(x)
 
     def _forward_standard(self, x: torch.Tensor) -> torch.Tensor:
