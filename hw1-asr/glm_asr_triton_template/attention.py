@@ -340,9 +340,10 @@ def flash_attention_fwd_kernel(
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
 ):
     """
-    FlashAttention-like forward kernel for the Phase 1 minimal path.
+    FlashAttention-like forward kernel for the fused path.
     Grid: (batch_heads, ceil_div(seq_q, BLOCK_M))
     """
     pid_bh = tl.program_id(0)
@@ -392,7 +393,11 @@ def flash_attention_fwd_kernel(
         ).to(tl.float32)
 
         scores = tl.dot(q, tl.trans(k), input_precision="ieee") * scale
-        scores = tl.where(mask_k[None, :], scores, -float("inf"))
+        valid_scores = mask_k[None, :]
+        if IS_CAUSAL:
+            causal_mask = offs_m[:, None] >= k_offsets[None, :]
+            valid_scores = valid_scores & causal_mask
+        scores = tl.where(valid_scores, scores, -float("inf"))
 
         m_ij = tl.max(scores, axis=1)
         m_new = tl.maximum(m_i, m_ij)
@@ -480,10 +485,10 @@ def _can_use_flash_attention(
     attention_mask: Optional[torch.Tensor],
     is_causal: bool,
 ) -> bool:
-    """Return whether the minimal Phase 1 flash path can handle this call."""
+    """Return whether the fused flash path can handle this call."""
     if not (q.is_cuda and k.is_cuda and v.is_cuda):
         return False
-    if attention_mask is not None or is_causal:
+    if attention_mask is not None:
         return False
     if q.shape[-1] not in FLASH_ATTENTION_CONFIGS:
         return False
@@ -495,6 +500,8 @@ def _can_use_flash_attention(
         return False
     if q.shape[-2] == 0 or k.shape[-2] == 0:
         return False
+    if is_causal and q.shape[-2] != k.shape[-2]:
+        return False
     return True
 
 
@@ -503,8 +510,9 @@ def _flash_scaled_dot_product_attention(
     k: torch.Tensor,
     v: torch.Tensor,
     scale: float,
+    is_causal: bool = False,
 ) -> torch.Tensor:
-    """Launch the minimal FlashAttention-like forward kernel."""
+    """Launch the fused FlashAttention-like forward kernel."""
     batch, num_heads, seq_q, head_dim = q.shape
     _, _, seq_k, _ = k.shape
     config = FLASH_ATTENTION_CONFIGS[head_dim]
@@ -544,6 +552,7 @@ def _flash_scaled_dot_product_attention(
         HEAD_DIM=head_dim,
         BLOCK_M=config["block_m"],
         BLOCK_N=config["block_n"],
+        IS_CAUSAL=is_causal,
         num_warps=config["num_warps"],
         num_stages=config["num_stages"],
     )
@@ -569,7 +578,7 @@ def scaled_dot_product_attention(
         scale = 1.0 / np.sqrt(head_dim)
 
     if _can_use_flash_attention(q, k, v, attention_mask, is_causal):
-        return _flash_scaled_dot_product_attention(q, k, v, float(scale))
+        return _flash_scaled_dot_product_attention(q, k, v, float(scale), is_causal)
 
     seq_k_padded = next_power_of_two(seq_k)
     head_dim_padded = next_power_of_two(head_dim)
@@ -774,6 +783,22 @@ if __name__ == "__main__":
     v_ref = _expand_kv_for_gqa(v_gqa, num_heads // num_kv_heads)
     expected = torch_attention_reference(q, k_ref, v_ref, scale=attn.scale)
     _assert_attention_close("gqa", actual, expected)
+
+    # Decoder prefill-like path: GQA with causal masking
+    q = torch.randn(batch_size, num_heads, 13, head_dim, device=device)
+    k_gqa = torch.randn(batch_size, num_kv_heads, 13, head_dim, device=device)
+    v_gqa = torch.randn(batch_size, num_kv_heads, 13, head_dim, device=device)
+    actual = attn(q, k_gqa, v_gqa, is_causal=True)
+    k_ref = _expand_kv_for_gqa(k_gqa, num_heads // num_kv_heads)
+    v_ref = _expand_kv_for_gqa(v_gqa, num_heads // num_kv_heads)
+    expected = torch_attention_reference(
+        q,
+        k_ref,
+        v_ref,
+        is_causal=True,
+        scale=attn.scale,
+    )
+    _assert_attention_close("gqa_causal", actual, expected)
 
     # Decode-like path: q_len < k_len
     q = torch.randn(batch_size, num_heads, 3, head_dim, device=device)
