@@ -391,7 +391,7 @@ def flash_attention_fwd_kernel(
             other=0.0,
         ).to(tl.float32)
 
-        scores = tl.dot(q, tl.trans(k)) * scale
+        scores = tl.dot(q, tl.trans(k), input_precision="ieee") * scale
         scores = tl.where(mask_k[None, :], scores, -float("inf"))
 
         m_ij = tl.max(scores, axis=1)
@@ -400,7 +400,7 @@ def flash_attention_fwd_kernel(
         p = tl.exp(scores - m_new[:, None])
 
         l_i = l_i * alpha + tl.sum(p, axis=1)
-        acc = acc * alpha[:, None] + tl.dot(p, v)
+        acc = acc * alpha[:, None] + tl.dot(p, v, input_precision="ieee")
         m_i = m_new
 
     output = acc / l_i[:, None]
