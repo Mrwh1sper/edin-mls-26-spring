@@ -321,6 +321,7 @@ def flash_attention_fwd_kernel(
     q_ptr,
     k_ptr,
     v_ptr,
+    mask_ptr,
     output_ptr,
     scale,
     seq_q,
@@ -334,6 +335,9 @@ def flash_attention_fwd_kernel(
     stride_v0,
     stride_v1,
     stride_v2,
+    stride_m0,
+    stride_m1,
+    stride_m2,
     stride_o0,
     stride_o1,
     stride_o2,
@@ -341,6 +345,7 @@ def flash_attention_fwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
+    USE_ATTENTION_MASK: tl.constexpr,
 ):
     """
     FlashAttention-like forward kernel for the fused path.
@@ -393,6 +398,16 @@ def flash_attention_fwd_kernel(
         ).to(tl.float32)
 
         scores = tl.dot(q, tl.trans(k), input_precision="ieee") * scale
+        if USE_ATTENTION_MASK:
+            mask_block = tl.load(
+                mask_ptr
+                + pid_bh * stride_m0
+                + offs_m[:, None] * stride_m1
+                + k_offsets[None, :] * stride_m2,
+                mask=mask_q[:, None] & mask_k[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            scores = scores + mask_block
         valid_scores = mask_k[None, :]
         if IS_CAUSAL:
             causal_mask = offs_m[:, None] >= k_offsets[None, :]
@@ -478,6 +493,44 @@ def _assert_attention_close(
     print(f"  {name}: PASS (max_abs_diff={max_abs:.6f})")
 
 
+def _normalize_attention_mask(
+    attention_mask: Optional[torch.Tensor],
+    batch: int,
+    num_heads: int,
+    seq_q: int,
+    seq_k: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """Normalize additive attention masks to (batch_heads, seq_q, seq_k)."""
+    if attention_mask is None:
+        return None
+
+    mask = attention_mask.to(device=device, dtype=torch.float32)
+
+    if mask.ndim == 2:
+        if mask.shape != (seq_q, seq_k):
+            return None
+        mask = mask[None, None, :, :].expand(batch, num_heads, seq_q, seq_k)
+    elif mask.ndim == 3:
+        if mask.shape == (batch, seq_q, seq_k):
+            mask = mask[:, None, :, :].expand(batch, num_heads, seq_q, seq_k)
+        elif mask.shape == (batch * num_heads, seq_q, seq_k):
+            return mask.contiguous()
+        else:
+            return None
+    elif mask.ndim == 4:
+        if mask.shape[0] != batch or mask.shape[2] != seq_q or mask.shape[3] != seq_k:
+            return None
+        if mask.shape[1] == 1:
+            mask = mask.expand(batch, num_heads, seq_q, seq_k)
+        elif mask.shape[1] != num_heads:
+            return None
+    else:
+        return None
+
+    return mask.reshape(batch * num_heads, seq_q, seq_k).contiguous()
+
+
 def _can_use_flash_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -487,8 +540,6 @@ def _can_use_flash_attention(
 ) -> bool:
     """Return whether the fused flash path can handle this call."""
     if not (q.is_cuda and k.is_cuda and v.is_cuda):
-        return False
-    if attention_mask is not None:
         return False
     if q.shape[-1] not in FLASH_ATTENTION_CONFIGS:
         return False
@@ -511,6 +562,7 @@ def _flash_scaled_dot_product_attention(
     v: torch.Tensor,
     scale: float,
     is_causal: bool = False,
+    attention_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Launch the fused FlashAttention-like forward kernel."""
     batch, num_heads, seq_q, head_dim = q.shape
@@ -527,12 +579,14 @@ def _flash_scaled_dot_product_attention(
         v.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32).contiguous()
     )
     output = torch.empty_like(q_flat, dtype=torch.float32)
+    mask_flat = attention_mask if attention_mask is not None else q_flat
 
     grid = (batch * num_heads, triton.cdiv(seq_q, config["block_m"]))
     flash_attention_fwd_kernel[grid](
         q_flat,
         k_flat,
         v_flat,
+        mask_flat,
         output,
         float(scale),
         seq_q,
@@ -546,6 +600,9 @@ def _flash_scaled_dot_product_attention(
         v_flat.stride(0),
         v_flat.stride(1),
         v_flat.stride(2),
+        mask_flat.stride(0),
+        mask_flat.stride(1),
+        mask_flat.stride(2),
         output.stride(0),
         output.stride(1),
         output.stride(2),
@@ -553,6 +610,7 @@ def _flash_scaled_dot_product_attention(
         BLOCK_M=config["block_m"],
         BLOCK_N=config["block_n"],
         IS_CAUSAL=is_causal,
+        USE_ATTENTION_MASK=attention_mask is not None,
         num_warps=config["num_warps"],
         num_stages=config["num_stages"],
     )
@@ -577,8 +635,25 @@ def scaled_dot_product_attention(
     if scale is None:
         scale = 1.0 / np.sqrt(head_dim)
 
-    if _can_use_flash_attention(q, k, v, attention_mask, is_causal):
-        return _flash_scaled_dot_product_attention(q, k, v, float(scale), is_causal)
+    normalized_attention_mask = _normalize_attention_mask(
+        attention_mask,
+        batch,
+        num_heads,
+        seq_q,
+        seq_k,
+        q.device,
+    )
+
+    if attention_mask is None or normalized_attention_mask is not None:
+        if _can_use_flash_attention(q, k, v, normalized_attention_mask, is_causal):
+            return _flash_scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                float(scale),
+                is_causal,
+                attention_mask=normalized_attention_mask,
+            )
 
     seq_k_padded = next_power_of_two(seq_k)
     head_dim_padded = next_power_of_two(head_dim)
@@ -587,6 +662,7 @@ def scaled_dot_product_attention(
         q.is_cuda
         and seq_k_padded <= MAX_ATTENTION_DIM
         and head_dim_padded <= MAX_ATTENTION_DIM
+        and (attention_mask is None or normalized_attention_mask is not None)
     )
 
     if use_triton:
@@ -656,10 +732,7 @@ def scaled_dot_product_attention(
             scores = scores + mask[None, :, :]
 
         if attention_mask is not None:
-            if attention_mask.ndim == 4:
-                attention_mask = attention_mask.reshape(
-                    batch * num_heads, seq_q, seq_k
-                )
+            attention_mask = normalized_attention_mask
             if seq_k_padded != seq_k:
                 mask_padded = torch.zeros(
                     (batch * num_heads, seq_q, seq_k_padded),
@@ -711,7 +784,9 @@ def scaled_dot_product_attention(
         ) * -1e9
         scores = scores + mask[None, None, :, :]
 
-    if attention_mask is not None:
+    if normalized_attention_mask is not None:
+        scores = scores + normalized_attention_mask.reshape(batch, num_heads, seq_q, seq_k)
+    elif attention_mask is not None:
         scores = scores + attention_mask
 
     scores = scores - torch.max(scores, dim=-1, keepdim=True).values
@@ -761,12 +836,22 @@ if __name__ == "__main__":
     k = torch.randn(batch_size, num_heads, 17, head_dim, device=device)
     v = torch.randn(batch_size, num_heads, 17, head_dim, device=device)
     mask = torch.zeros(
-        (batch_size, num_heads, 17, 17), dtype=torch.float32, device=device
+        (batch_size, 1, 17, 17), dtype=torch.float32, device=device
     )
     mask[:, :, :, 17 // 2 :] = -1e9
     actual = scaled_dot_product_attention(q, k, v, attention_mask=mask)
     expected = torch_attention_reference(q, k, v, attention_mask=mask)
     _assert_attention_close("masked", actual, expected)
+
+    # Combined causal + external mask with batch-level broadcast
+    q = torch.randn(batch_size, num_heads, 16, head_dim, device=device)
+    k = torch.randn(batch_size, num_heads, 16, head_dim, device=device)
+    v = torch.randn(batch_size, num_heads, 16, head_dim, device=device)
+    mask = torch.zeros((batch_size, 1, 16, 16), dtype=torch.float32, device=device)
+    mask[:, :, :, 12:] = -1e9
+    actual = scaled_dot_product_attention(q, k, v, attention_mask=mask, is_causal=True)
+    expected = torch_attention_reference(q, k, v, attention_mask=mask, is_causal=True)
+    _assert_attention_close("masked_causal", actual, expected)
 
     # Grouped Query Attention path through MultiHeadAttention
     num_kv_heads = 2
