@@ -311,7 +311,7 @@ def next_power_of_two(x: int) -> int:
 
 MAX_ATTENTION_DIM = 256
 FLASH_ATTENTION_CONFIGS = {
-    64: {"block_m": 64, "block_n": 64, "num_warps": 4, "num_stages": 2},
+    64: {"block_m": 32, "block_n": 64, "num_warps": 4, "num_stages": 2},
     128: {"block_m": 32, "block_n": 64, "num_warps": 8, "num_stages": 2},
 }
 
