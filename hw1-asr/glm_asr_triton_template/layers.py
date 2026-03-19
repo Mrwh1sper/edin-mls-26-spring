@@ -725,11 +725,16 @@ def get_activation(name: str):
 class Linear:
     """Linear layer with switchable backend (torch or Triton)."""
 
-    TILE_M = 64
-    TILE_N = 64
-    TILE_K = 32
+    TILE_M = 128 #finetuning, used to be 64
+    TILE_N = 128 #finetuning, used to be 64
+    TILE_K = 32 #finetuning, used to be 32
 
-    BACKEND = "torch"
+    NUM_WARPS = 4
+    NUM_STAGES = 2
+
+    #BACKEND = "torch"
+    #BACKEND = "triton"
+    BACKEND = "auto"
 
     def __init__(self, in_features: int, out_features: int, bias: bool = True):
         self.in_features = in_features
@@ -768,7 +773,13 @@ class Linear:
             return self._forward_torch(x)
         if Linear.BACKEND == "triton":
             return self._forward_triton(x)
+        
         M = int(np.prod(x.shape[:-1]))
+
+        # 避开特别大的输出投影层，比如 lm_head
+        if self.out_features > 50000:
+            return self._forward_torch(x)
+        
         if M >= self.TILE_M and x.is_cuda:
             return self._forward_triton(x)
         return self._forward_torch(x)
@@ -844,6 +855,8 @@ class Linear:
             BLOCK_M=self.TILE_M,
             BLOCK_N=self.TILE_N,
             BLOCK_K=self.TILE_K,
+	        num_warps=self.NUM_WARPS,
+    	    num_stages=self.NUM_STAGES,
         )
 
         output = output[:M, :N]
@@ -933,7 +946,12 @@ class MLP:
     """MLP with SwiGLU gating using Triton."""
 
     FUSED = True
-    TILE_M, TILE_N, TILE_K = 64, 64, 32
+    #TILE_M, TILE_N, TILE_K = 64, 64, 32
+    TILE_M, TILE_N, TILE_K = 128, 64, 32   #1238.1ms
+    #TILE_M, TILE_N, TILE_K = 64, 128, 32    #1328.5 ms
+    #TILE_M, TILE_N, TILE_K = 128, 128, 32   #1393.5ms
+    #TILE_M, TILE_N, TILE_K = 128, 64, 64    #1242.0ms
+
 
     def __init__(
         self,
@@ -970,8 +988,8 @@ class MLP:
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_gating and MLP.FUSED and x.is_cuda:
-            #return self._forward_fused(x)
-            return self._forward_standard(x)
+            return self._forward_fused(x)
+            #return self._forward_standard(x)
         return self._forward_standard(x)
 
     def _forward_standard(self, x: torch.Tensor) -> torch.Tensor:
@@ -1061,7 +1079,9 @@ class EncoderMLP:
     """Encoder MLP (no gating) using Triton."""
 
     FUSED = True
-    TILE_M, TILE_N, TILE_K = 64, 64, 32
+    #TILE_M, TILE_N, TILE_K = 64, 64, 32
+    TILE_M, TILE_N, TILE_K = 128, 64, 32   #1237.4ms
+    #TILE_M, TILE_N, TILE_K = 128, 128, 32  #1237.7ms
 
     def __init__(
         self,
