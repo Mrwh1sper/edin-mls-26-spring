@@ -409,7 +409,8 @@ def flash_attention_fwd_kernel(
             scores = scores + mask_block
         valid_scores = mask_k[None, :]
         if IS_CAUSAL:
-            causal_mask = offs_m[:, None] >= k_offsets[None, :]
+            q_offsets = (seq_k - seq_q) + offs_m
+            causal_mask = q_offsets[:, None] >= k_offsets[None, :]
             valid_scores = valid_scores & causal_mask
         scores = tl.where(valid_scores, scores, -float("inf"))
 
@@ -443,6 +444,24 @@ def _expand_kv_for_gqa(x: torch.Tensor, num_repeats: int) -> torch.Tensor:
     return x_expanded.reshape(batch, num_kv_heads * num_repeats, seq_len, head_dim)
 
 
+def _build_causal_additive_mask(
+    seq_q: int,
+    seq_k: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Build a lower-right aligned additive causal mask for decoder-style attention."""
+    q_start = max(seq_k - seq_q, 0)
+    q_positions = q_start + torch.arange(seq_q, device=device)
+    k_positions = torch.arange(seq_k, device=device)
+    causal = k_positions[None, :] <= q_positions[:, None]
+    return torch.where(
+        causal,
+        torch.zeros(1, device=device, dtype=dtype),
+        torch.full((1,), -1e9, device=device, dtype=dtype),
+    )
+
+
 def torch_attention_reference(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -462,10 +481,9 @@ def torch_attention_reference(
     scores = scores * float(scale)
 
     if is_causal:
-        causal_mask = torch.triu(
-            torch.ones((seq_q, seq_k), dtype=torch.float32, device=q.device),
-            diagonal=1,
-        ) * -1e9
+        causal_mask = _build_causal_additive_mask(
+            seq_q, seq_k, q.device, torch.float32
+        )
         scores = scores + causal_mask[None, None, :, :]
 
     if attention_mask is not None:
@@ -552,7 +570,7 @@ def _can_use_flash_attention(
         return False
     if q.shape[-2] == 0 or k.shape[-2] == 0:
         return False
-    if is_causal and q.shape[-2] != k.shape[-2]:
+    if is_causal and q.shape[-2] > k.shape[-2]:
         return False
     return True
 
@@ -739,11 +757,10 @@ def scaled_dot_product_attention(
             scores[:, :, seq_k:] = -1e9
 
         if is_causal:
-            mask = torch.triu(
-                torch.ones((seq_q, seq_k_padded), dtype=torch.float32, device=q.device),
-                diagonal=1,
-            ) * -1e9
-            scores = scores + mask[None, :, :]
+            causal_mask = _build_causal_additive_mask(
+                seq_q, seq_k, q.device, torch.float32
+            )
+            scores[:, :, :seq_k] = scores[:, :, :seq_k] + causal_mask[None, :, :]
 
         if attention_mask is not None:
             attention_mask = normalized_attention_mask
@@ -792,11 +809,10 @@ def scaled_dot_product_attention(
     scores = torch.einsum("bnqd,bnkd->bnqk", q, k) * scale
 
     if is_causal:
-        mask = torch.triu(
-            torch.ones((seq_q, seq_k), dtype=torch.float32, device=q.device),
-            diagonal=1,
-        ) * -1e9
-        scores = scores + mask[None, None, :, :]
+        causal_mask = _build_causal_additive_mask(
+            seq_q, seq_k, q.device, torch.float32
+        )
+        scores = scores + causal_mask[None, None, :, :]
 
     if normalized_attention_mask is not None:
         scores = scores + normalized_attention_mask.reshape(batch, num_heads, seq_q, seq_k)
