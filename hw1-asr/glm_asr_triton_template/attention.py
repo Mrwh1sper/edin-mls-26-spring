@@ -893,6 +893,30 @@ if __name__ == "__main__":
     expected = torch_attention_reference(q, k, v)
     _assert_attention_close("q_len_lt_k_len", actual, expected)
 
+    # Decode-like causal path: q_len < k_len
+    q = torch.randn(batch_size, num_heads, 3, head_dim, device=device)
+    k = torch.randn(batch_size, num_heads, 11, head_dim, device=device)
+    v = torch.randn(batch_size, num_heads, 11, head_dim, device=device)
+    actual = scaled_dot_product_attention(q, k, v, is_causal=True)
+    expected = torch_attention_reference(q, k, v, is_causal=True)
+    _assert_attention_close("decode_like_causal", actual, expected)
+
+    # Decode-like causal path with GQA
+    q = torch.randn(batch_size, num_heads, 3, head_dim, device=device)
+    k_gqa = torch.randn(batch_size, num_kv_heads, 11, head_dim, device=device)
+    v_gqa = torch.randn(batch_size, num_kv_heads, 11, head_dim, device=device)
+    actual = attn(q, k_gqa, v_gqa, is_causal=True)
+    k_ref = _expand_kv_for_gqa(k_gqa, num_heads // num_kv_heads)
+    v_ref = _expand_kv_for_gqa(v_gqa, num_heads // num_kv_heads)
+    expected = torch_attention_reference(
+        q,
+        k_ref,
+        v_ref,
+        is_causal=True,
+        scale=attn.scale,
+    )
+    _assert_attention_close("gqa_decode_like_causal", actual, expected)
+
     print("\nAll Triton attention reference checks passed.")
 
     print("\nTriton Attention working!")
