@@ -284,13 +284,6 @@ class MultiHeadAttention:
         Returns:
             Output (batch, num_heads, seq_q, head_dim)
         """
-        batch, num_heads, seq_q, head_dim = q.shape
-        _, num_kv_heads, seq_k, _ = k.shape
-
-        if num_kv_heads != num_heads:
-            k = self._expand_kv(k, self.num_queries_per_kv)
-            v = self._expand_kv(v, self.num_queries_per_kv)
-
         return scaled_dot_product_attention(
             q, k, v, attention_mask, is_causal, self.scale
         )
@@ -341,6 +334,9 @@ def flash_attention_fwd_kernel(
     stride_o0,
     stride_o1,
     stride_o2,
+    NUM_HEADS: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    NUM_QUERIES_PER_KV: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -353,6 +349,9 @@ def flash_attention_fwd_kernel(
     """
     pid_bh = tl.program_id(0)
     pid_m = tl.program_id(1)
+    pid_batch = pid_bh // NUM_HEADS
+    pid_head = pid_bh % NUM_HEADS
+    pid_kv = pid_batch * NUM_KV_HEADS + (pid_head // NUM_QUERIES_PER_KV)
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
@@ -381,7 +380,7 @@ def flash_attention_fwd_kernel(
 
         k = tl.load(
             k_ptr
-            + pid_bh * stride_k0
+            + pid_kv * stride_k0
             + k_offsets[:, None] * stride_k1
             + offs_d[None, :] * stride_k2,
             mask=mask_kd,
@@ -390,7 +389,7 @@ def flash_attention_fwd_kernel(
 
         v = tl.load(
             v_ptr
-            + pid_bh * stride_v0
+            + pid_kv * stride_v0
             + k_offsets[:, None] * stride_v1
             + offs_d[None, :] * stride_v2,
             mask=mask_kd,
@@ -547,7 +546,9 @@ def _can_use_flash_attention(
         return False
     if q.shape[0] != k.shape[0] or q.shape[0] != v.shape[0]:
         return False
-    if q.shape[1] != k.shape[1] or q.shape[1] != v.shape[1]:
+    if k.shape[1] != v.shape[1]:
+        return False
+    if q.shape[1] % k.shape[1] != 0:
         return False
     if q.shape[-2] == 0 or k.shape[-2] == 0:
         return False
@@ -566,17 +567,18 @@ def _flash_scaled_dot_product_attention(
 ) -> torch.Tensor:
     """Launch the fused FlashAttention-like forward kernel."""
     batch, num_heads, seq_q, head_dim = q.shape
-    _, _, seq_k, _ = k.shape
+    _, num_kv_heads, seq_k, _ = k.shape
     config = FLASH_ATTENTION_CONFIGS[head_dim]
+    num_queries_per_kv = num_heads // num_kv_heads
 
     q_flat = (
         q.reshape(batch * num_heads, seq_q, head_dim).to(torch.float32).contiguous()
     )
     k_flat = (
-        k.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32).contiguous()
+        k.reshape(batch * num_kv_heads, seq_k, head_dim).to(torch.float32).contiguous()
     )
     v_flat = (
-        v.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32).contiguous()
+        v.reshape(batch * num_kv_heads, seq_k, head_dim).to(torch.float32).contiguous()
     )
     output = torch.empty_like(q_flat, dtype=torch.float32)
     mask_flat = attention_mask if attention_mask is not None else q_flat
@@ -606,6 +608,9 @@ def _flash_scaled_dot_product_attention(
         output.stride(0),
         output.stride(1),
         output.stride(2),
+        NUM_HEADS=num_heads,
+        NUM_KV_HEADS=num_kv_heads,
+        NUM_QUERIES_PER_KV=num_queries_per_kv,
         HEAD_DIM=head_dim,
         BLOCK_M=config["block_m"],
         BLOCK_N=config["block_n"],
@@ -654,6 +659,15 @@ def scaled_dot_product_attention(
                 is_causal,
                 attention_mask=normalized_attention_mask,
             )
+
+    if k.shape[1] != q.shape[1]:
+        if q.shape[1] % k.shape[1] != 0:
+            raise ValueError(
+                f"num_heads ({q.shape[1]}) must be divisible by num_kv_heads ({k.shape[1]})"
+            )
+        num_queries_per_kv = q.shape[1] // k.shape[1]
+        k = _expand_kv_for_gqa(k, num_queries_per_kv)
+        v = _expand_kv_for_gqa(v, num_queries_per_kv)
 
     seq_k_padded = next_power_of_two(seq_k)
     head_dim_padded = next_power_of_two(head_dim)
