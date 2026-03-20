@@ -796,6 +796,246 @@ def scaled_dot_product_attention(
 
     return output.to(q.dtype)
 
+def scaled_dot_product_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    is_causal: bool = False,
+    scale: Optional[float] = None,
+    prefer_sdpa: bool = True,
+) -> torch.Tensor:
+    batch, num_heads, seq_q, head_dim = q.shape
+    _, num_kv_heads, seq_k, _ = k.shape
+
+    if scale is None:
+        scale = 1.0 / np.sqrt(head_dim)
+
+    # 1) Fast path: PyTorch fused SDPA / Flash Attention
+    if prefer_sdpa and q.is_cuda:
+        try:
+            sdpa_kwargs = dict(
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                is_causal=is_causal,
+            )
+
+            # GQA support for SDPA fast path
+            if num_kv_heads != num_heads:
+                if num_heads % num_kv_heads != 0:
+                    raise ValueError(
+                        f"num_heads ({num_heads}) must be divisible by "
+                        f"num_kv_heads ({num_kv_heads})"
+                    )
+                sdpa_kwargs["enable_gqa"] = True
+
+            # PyTorch SDPA does not allow attn_mask and is_causal together
+            if attention_mask is not None and is_causal:
+                causal = torch.triu(
+                    torch.full(
+                        (seq_q, seq_k),
+                        float("-inf"),
+                        device=q.device,
+                        dtype=q.dtype,
+                    ),
+                    diagonal=1,
+                )
+                if attention_mask.dtype == torch.bool:
+                    # SDPA bool mask semantics: True = allowed, False = masked
+                    # Convert bool mask to additive mask first
+                    additive_mask = torch.where(
+                        attention_mask,
+                        torch.zeros(1, device=q.device, dtype=q.dtype),
+                        torch.full((1,), float("-inf"), device=q.device, dtype=q.dtype),
+                    )
+                else:
+                    additive_mask = attention_mask.to(q.dtype)
+
+                sdpa_kwargs["attn_mask"] = additive_mask + causal
+                sdpa_kwargs["is_causal"] = False
+
+            return F.scaled_dot_product_attention(q, k, v, **sdpa_kwargs).to(q.dtype)
+
+        except Exception:
+            pass
+
+    # 2) Triton / eager fallback path: expand KV here if needed
+    if num_kv_heads != num_heads:
+        if num_heads % num_kv_heads != 0:
+            raise ValueError(
+                f"num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
+            )
+        num_queries_per_kv = num_heads // num_kv_heads
+        k = torch.repeat_interleave(k, repeats=num_queries_per_kv, dim=1)
+        v = torch.repeat_interleave(v, repeats=num_queries_per_kv, dim=1)
+        num_kv_heads = num_heads
+
+    seq_k_padded = next_power_of_two(seq_k)
+    head_dim_padded = next_power_of_two(head_dim)
+
+    use_triton = (
+        q.is_cuda
+        and num_kv_heads == num_heads
+        and seq_k_padded <= MAX_ATTENTION_DIM
+        and head_dim_padded <= MAX_ATTENTION_DIM
+    )
+
+    if use_triton:
+        q_flat = q.reshape(batch * num_heads, seq_q, head_dim).contiguous()
+        k_flat = k.reshape(batch * num_heads, seq_k, head_dim).contiguous()
+        v_flat = v.reshape(batch * num_heads, seq_k, head_dim).contiguous()
+
+        if seq_k_padded != seq_k or head_dim_padded != head_dim:
+            k_padded = torch.zeros(
+                (batch * num_heads, seq_k_padded, head_dim_padded),
+                dtype=k.dtype,
+                device=q.device,
+            )
+            v_padded = torch.zeros(
+                (batch * num_heads, seq_k_padded, head_dim_padded),
+                dtype=v.dtype,
+                device=q.device,
+            )
+            q_padded = torch.zeros(
+                (batch * num_heads, seq_q, head_dim_padded),
+                dtype=q.dtype,
+                device=q.device,
+            )
+            k_padded[:, :seq_k, :head_dim] = k_flat
+            v_padded[:, :seq_k, :head_dim] = v_flat
+            q_padded[:, :, :head_dim] = q_flat
+            k_flat = k_padded
+            v_flat = v_padded
+            q_flat = q_padded
+
+        scores = torch.empty(
+            (batch * num_heads, seq_q, seq_k_padded),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        output = torch.empty(
+            (batch * num_heads, seq_q, head_dim_padded),
+            dtype=torch.float32,
+            device=q.device,
+        )
+
+        grid = (batch * num_heads, seq_q)
+        attention_scores_kernel[grid](
+            q_flat,
+            k_flat,
+            scores,
+            float(scale),
+            seq_k_padded,
+            head_dim_padded,
+            q_flat.stride(0),
+            q_flat.stride(1),
+            q_flat.stride(2),
+            k_flat.stride(0),
+            k_flat.stride(1),
+            k_flat.stride(2),
+            scores.stride(0),
+            scores.stride(1),
+            scores.stride(2),
+            BLOCK_K=seq_k_padded,
+            BLOCK_D=head_dim_padded,
+        )
+
+        if seq_k_padded != seq_k:
+            scores[:, :, seq_k:] = -1e9
+
+        if is_causal:
+            mask = torch.triu(
+                torch.ones((seq_q, seq_k_padded), dtype=torch.float32, device=q.device),
+                diagonal=1,
+            ) * -1e9
+            scores = scores + mask[None, :, :]
+
+        if attention_mask is not None:
+            if attention_mask.dtype == torch.bool:
+                attention_mask = torch.where(
+                    attention_mask,
+                    torch.zeros(1, device=q.device, dtype=torch.float32),
+                    torch.full((1,), -1e9, device=q.device, dtype=torch.float32),
+                )
+            else:
+                attention_mask = attention_mask.to(torch.float32)
+
+            if attention_mask.ndim == 4:
+                attention_mask = attention_mask.reshape(batch * num_heads, seq_q, seq_k)
+
+            if seq_k_padded != seq_k:
+                mask_padded = torch.zeros(
+                    (batch * num_heads, seq_q, seq_k_padded),
+                    dtype=torch.float32,
+                    device=q.device,
+                )
+                mask_padded[:, :, :seq_k] = attention_mask
+                mask_padded[:, :, seq_k:] = -1e9
+                attention_mask = mask_padded
+
+            scores = scores + attention_mask
+
+        scores_2d = scores.reshape(batch * num_heads * seq_q, seq_k_padded)
+        softmax_inplace_kernel[(scores_2d.shape[0],)](
+            scores_2d,
+            scores_2d.stride(0),
+            seq_k_padded,
+            BLOCK_SIZE=seq_k_padded,
+        )
+        scores = scores_2d.reshape(batch * num_heads, seq_q, seq_k_padded)
+
+        attention_output_kernel[grid](
+            scores,
+            v_flat,
+            output,
+            seq_k_padded,
+            head_dim_padded,
+            scores.stride(0),
+            scores.stride(1),
+            scores.stride(2),
+            v_flat.stride(0),
+            v_flat.stride(1),
+            v_flat.stride(2),
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
+            BLOCK_K=seq_k_padded,
+            BLOCK_D=head_dim_padded,
+        )
+
+        if head_dim_padded != head_dim:
+            output = output[:, :, :head_dim]
+
+        return output.reshape(batch, num_heads, seq_q, head_dim).to(q.dtype)
+
+    # 3) Eager fallback
+    scores = torch.einsum("bnqd,bnkd->bnqk", q, k) * scale
+
+    if is_causal:
+        mask = torch.triu(
+            torch.ones((seq_q, seq_k), dtype=torch.float32, device=q.device),
+            diagonal=1,
+        ) * -1e9
+        scores = scores + mask[None, None, :, :]
+
+    if attention_mask is not None:
+        if attention_mask.dtype == torch.bool:
+            attention_mask = torch.where(
+                attention_mask,
+                torch.zeros(1, device=q.device, dtype=torch.float32),
+                torch.full((1,), -1e9, device=q.device, dtype=torch.float32),
+            )
+        else:
+            attention_mask = attention_mask.to(torch.float32)
+        scores = scores + attention_mask
+
+    scores = scores - torch.max(scores, dim=-1, keepdim=True).values
+    attn_weights = torch.exp(scores)
+    attn_weights = attn_weights / torch.sum(attn_weights, dim=-1, keepdim=True)
+    output = torch.einsum("bnqk,bnkd->bnqd", attn_weights, v)
+
+    return output.to(q.dtype)
+
 
 if __name__ == "__main__":
     print("Testing Triton Attention...")
