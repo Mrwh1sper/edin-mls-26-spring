@@ -6,8 +6,9 @@ End-to-end implementation using Triton kernels
 Fill in the TODO sections to implement core layers using Triton kernels
 """
 
+from collections import Counter
 import math
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -34,6 +35,117 @@ def pad_to_multiple(size: int, multiple: int) -> int:
 def next_power_of_two(x: int) -> int:
     """Return the smallest power of two >= x."""
     return 1 << (x - 1).bit_length() if x > 0 else 1
+
+
+def _new_layer_profile_stats() -> Dict[str, Any]:
+    """Create a fresh container for lightweight layer dispatch statistics."""
+    return {
+        "linear_total_calls": 0,
+        "linear_backend_requested": Counter(),
+        "linear_backend_actual": Counter(),
+        "linear_auto_decisions": Counter(),
+        "linear_shape_counts": Counter(),
+        "mlp_total_calls": 0,
+        "mlp_mode_counts": Counter(),
+        "encoder_mlp_total_calls": 0,
+        "encoder_mlp_mode_counts": Counter(),
+    }
+
+
+_LAYER_PROFILE_STATS = _new_layer_profile_stats()
+
+
+def reset_layer_profile_stats():
+    """Reset layer dispatch statistics."""
+    global _LAYER_PROFILE_STATS
+    _LAYER_PROFILE_STATS = _new_layer_profile_stats()
+
+
+def get_layer_profile_stats() -> Dict[str, Any]:
+    """Return a JSON-friendly copy of layer dispatch statistics."""
+    return {
+        "linear_total_calls": _LAYER_PROFILE_STATS["linear_total_calls"],
+        "linear_backend_requested": dict(
+            _LAYER_PROFILE_STATS["linear_backend_requested"]
+        ),
+        "linear_backend_actual": dict(_LAYER_PROFILE_STATS["linear_backend_actual"]),
+        "linear_auto_decisions": dict(_LAYER_PROFILE_STATS["linear_auto_decisions"]),
+        "linear_shape_counts": dict(_LAYER_PROFILE_STATS["linear_shape_counts"]),
+        "mlp_total_calls": _LAYER_PROFILE_STATS["mlp_total_calls"],
+        "mlp_mode_counts": dict(_LAYER_PROFILE_STATS["mlp_mode_counts"]),
+        "encoder_mlp_total_calls": _LAYER_PROFILE_STATS["encoder_mlp_total_calls"],
+        "encoder_mlp_mode_counts": dict(
+            _LAYER_PROFILE_STATS["encoder_mlp_mode_counts"]
+        ),
+    }
+
+
+def format_layer_profile_stats(top_n_shapes: int = 8) -> str:
+    """Format layer dispatch statistics for benchmark logs."""
+    stats = get_layer_profile_stats()
+    lines = [
+        "=" * 70,
+        "LAYER DISPATCH SUMMARY",
+        "=" * 70,
+        f"Linear total calls:           {stats['linear_total_calls']}",
+    ]
+    if stats["linear_backend_requested"]:
+        lines.extend(["", "Linear requested backend:"])
+        for key, count in sorted(
+            stats["linear_backend_requested"].items(),
+            key=lambda item: (-item[1], item[0]),
+        ):
+            lines.append(f"  {key:<28} {count}")
+    if stats["linear_backend_actual"]:
+        lines.extend(["", "Linear actual backend:"])
+        for key, count in sorted(
+            stats["linear_backend_actual"].items(),
+            key=lambda item: (-item[1], item[0]),
+        ):
+            lines.append(f"  {key:<28} {count}")
+    if stats["linear_auto_decisions"]:
+        lines.extend(["", "Linear auto decisions:"])
+        for key, count in sorted(
+            stats["linear_auto_decisions"].items(),
+            key=lambda item: (-item[1], item[0]),
+        ):
+            lines.append(f"  {key:<28} {count}")
+    lines.extend(
+        [
+            "",
+            f"MLP total calls:              {stats['mlp_total_calls']}",
+            f"EncoderMLP total calls:       {stats['encoder_mlp_total_calls']}",
+        ]
+    )
+    if stats["mlp_mode_counts"]:
+        lines.extend(["", "MLP mode counts:"])
+        for key, count in sorted(
+            stats["mlp_mode_counts"].items(), key=lambda item: (-item[1], item[0])
+        ):
+            lines.append(f"  {key:<28} {count}")
+    if stats["encoder_mlp_mode_counts"]:
+        lines.extend(["", "EncoderMLP mode counts:"])
+        for key, count in sorted(
+            stats["encoder_mlp_mode_counts"].items(),
+            key=lambda item: (-item[1], item[0]),
+        ):
+            lines.append(f"  {key:<28} {count}")
+    if stats["linear_shape_counts"]:
+        lines.extend(["", f"Top {min(top_n_shapes, len(stats['linear_shape_counts']))} Linear shapes:"])
+        for shape_key, count in sorted(
+            stats["linear_shape_counts"].items(),
+            key=lambda item: (-item[1], item[0]),
+        )[:top_n_shapes]:
+            lines.append(f"  {shape_key:<48} {count}")
+    return "\n".join(lines)
+
+
+def _record_linear_shape(m: int, in_features: int, out_features: int, is_cuda: bool):
+    """Record a compact Linear call signature for benchmark analysis."""
+    shape_key = (
+        f"m={m}|in={in_features}|out={out_features}|cuda={int(is_cuda)}"
+    )
+    _LAYER_PROFILE_STATS["linear_shape_counts"][shape_key] += 1
 
 
 # ============================================================================
@@ -769,19 +881,30 @@ class Linear:
                 self._weight_t_padded = weight_t
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        M = int(np.prod(x.shape[:-1]))
+        _LAYER_PROFILE_STATS["linear_total_calls"] += 1
+        _LAYER_PROFILE_STATS["linear_backend_requested"][Linear.BACKEND] += 1
+        _record_linear_shape(M, self.in_features, self.out_features, x.is_cuda)
+
         if Linear.BACKEND in ("torch", "cublas"):
+            _LAYER_PROFILE_STATS["linear_backend_actual"]["torch"] += 1
             return self._forward_torch(x)
         if Linear.BACKEND == "triton":
+            _LAYER_PROFILE_STATS["linear_backend_actual"]["triton"] += 1
             return self._forward_triton(x)
-        
-        M = int(np.prod(x.shape[:-1]))
 
         # 避开特别大的输出投影层，比如 lm_head
         if self.out_features > 50000:
+            _LAYER_PROFILE_STATS["linear_backend_actual"]["torch"] += 1
+            _LAYER_PROFILE_STATS["linear_auto_decisions"]["large_output_fallback"] += 1
             return self._forward_torch(x)
-        
+
         if M >= self.TILE_M and x.is_cuda:
+            _LAYER_PROFILE_STATS["linear_backend_actual"]["triton"] += 1
+            _LAYER_PROFILE_STATS["linear_auto_decisions"]["auto_triton"] += 1
             return self._forward_triton(x)
+        _LAYER_PROFILE_STATS["linear_backend_actual"]["torch"] += 1
+        _LAYER_PROFILE_STATS["linear_auto_decisions"]["auto_torch"] += 1
         return self._forward_torch(x)
 
     def _forward_torch(self, x: torch.Tensor) -> torch.Tensor:
@@ -987,9 +1110,11 @@ class MLP:
             self._up_weight_t = self.up_proj.weight.t().contiguous()
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        _LAYER_PROFILE_STATS["mlp_total_calls"] += 1
         if self.use_gating and MLP.FUSED and x.is_cuda:
+            _LAYER_PROFILE_STATS["mlp_mode_counts"]["fused"] += 1
             return self._forward_fused(x)
-            #return self._forward_standard(x)
+        _LAYER_PROFILE_STATS["mlp_mode_counts"]["standard"] += 1
         return self._forward_standard(x)
 
     def _forward_standard(self, x: torch.Tensor) -> torch.Tensor:
@@ -1106,8 +1231,11 @@ class EncoderMLP:
             self._fc1_weight_t = self.fc1.weight.t().contiguous()
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        _LAYER_PROFILE_STATS["encoder_mlp_total_calls"] += 1
         if EncoderMLP.FUSED and self.activation == "gelu" and x.is_cuda:
+            _LAYER_PROFILE_STATS["encoder_mlp_mode_counts"]["fused"] += 1
             return self._forward_fused(x)
+        _LAYER_PROFILE_STATS["encoder_mlp_mode_counts"]["standard"] += 1
         return self._forward_standard(x)
 
     def _forward_standard(self, x: torch.Tensor) -> torch.Tensor:
@@ -1230,5 +1358,7 @@ if __name__ == "__main__":
     mlp = MLP(256, 512, activation="silu", use_gating=True)
     y = mlp(x)
     print(f"Input: {x.shape} -> Output: {y.shape}")
+
+    print("\n" + format_layer_profile_stats())
 
     print("\nAll Triton layers working!")

@@ -20,6 +20,36 @@ import importlib
 # Expected transcription for the test audio
 EXPECTED_TEXT = "CONCORD RETURNED TO ITS PLACE AMIDST THE TENTS"
 
+
+def _reset_optional_profile_stats():
+    """Reset optional dispatch statistics exposed by student modules."""
+    for module_name, reset_name in (
+        ("attention", "reset_attention_profile_stats"),
+        ("layers", "reset_layer_profile_stats"),
+    ):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            continue
+        reset_fn = getattr(module, reset_name, None)
+        if callable(reset_fn):
+            reset_fn()
+
+
+def _print_optional_profile_stats():
+    """Print optional dispatch statistics exposed by student modules."""
+    for module_name, format_name in (
+        ("attention", "format_attention_profile_stats"),
+        ("layers", "format_layer_profile_stats"),
+    ):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            continue
+        format_fn = getattr(module, format_name, None)
+        if callable(format_fn):
+            print("\n" + format_fn())
+
 def download_librispeech_sample():
     """Download a LibriSpeech sample audio file."""
     import urllib.request
@@ -296,6 +326,8 @@ def benchmark_triton_folder(folder_name, audio_array, num_warmup=1, num_runs=3):
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
+    _reset_optional_profile_stats()
+
     print(f"Benchmarking ({num_runs} runs)...")
     times = []
     for i in range(num_runs):
@@ -322,6 +354,8 @@ def benchmark_triton_folder(folder_name, audio_array, num_warmup=1, num_runs=3):
 
     generated_np = output.detach().cpu().numpy()
     transcription = decode_output(generated_np, processor)
+
+    _print_optional_profile_stats()
 
     sys.path.remove(folder_path)
 

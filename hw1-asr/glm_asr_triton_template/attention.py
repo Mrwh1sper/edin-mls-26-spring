@@ -6,11 +6,12 @@ End-to-end implementation using Triton kernels
 Fill in the TODO sections to implement attention using Triton kernels
 """
 
+from collections import Counter
 import numpy as np
 import torch
 import triton
 import triton.language as tl
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 
 def get_stream():
@@ -18,6 +19,122 @@ def get_stream():
     if torch.cuda.is_available():
         return torch.cuda.current_stream().cuda_stream
     return None
+
+
+def _new_attention_profile_stats() -> Dict[str, Any]:
+    """Create a fresh container for lightweight attention dispatch statistics."""
+    return {
+        "total_calls": 0,
+        "flash_calls": 0,
+        "fallback_triton_calls": 0,
+        "fallback_torch_calls": 0,
+        "causal_calls": 0,
+        "masked_calls": 0,
+        "gqa_calls": 0,
+        "decode_like_calls": 0,
+        "flash_causal_calls": 0,
+        "flash_masked_calls": 0,
+        "flash_gqa_calls": 0,
+        "flash_decode_like_calls": 0,
+        "ineligible_reasons": Counter(),
+        "shape_counts": Counter(),
+    }
+
+
+_ATTENTION_PROFILE_STATS = _new_attention_profile_stats()
+
+
+def reset_attention_profile_stats():
+    """Reset attention dispatch statistics."""
+    global _ATTENTION_PROFILE_STATS
+    _ATTENTION_PROFILE_STATS = _new_attention_profile_stats()
+
+
+def get_attention_profile_stats() -> Dict[str, Any]:
+    """Return a JSON-friendly copy of attention dispatch statistics."""
+    return {
+        "total_calls": _ATTENTION_PROFILE_STATS["total_calls"],
+        "flash_calls": _ATTENTION_PROFILE_STATS["flash_calls"],
+        "fallback_triton_calls": _ATTENTION_PROFILE_STATS["fallback_triton_calls"],
+        "fallback_torch_calls": _ATTENTION_PROFILE_STATS["fallback_torch_calls"],
+        "causal_calls": _ATTENTION_PROFILE_STATS["causal_calls"],
+        "masked_calls": _ATTENTION_PROFILE_STATS["masked_calls"],
+        "gqa_calls": _ATTENTION_PROFILE_STATS["gqa_calls"],
+        "decode_like_calls": _ATTENTION_PROFILE_STATS["decode_like_calls"],
+        "flash_causal_calls": _ATTENTION_PROFILE_STATS["flash_causal_calls"],
+        "flash_masked_calls": _ATTENTION_PROFILE_STATS["flash_masked_calls"],
+        "flash_gqa_calls": _ATTENTION_PROFILE_STATS["flash_gqa_calls"],
+        "flash_decode_like_calls": _ATTENTION_PROFILE_STATS["flash_decode_like_calls"],
+        "ineligible_reasons": dict(_ATTENTION_PROFILE_STATS["ineligible_reasons"]),
+        "shape_counts": dict(_ATTENTION_PROFILE_STATS["shape_counts"]),
+    }
+
+
+def format_attention_profile_stats(top_n_shapes: int = 8) -> str:
+    """Format attention dispatch statistics for benchmark logs."""
+    stats = get_attention_profile_stats()
+    total = stats["total_calls"]
+    flash = stats["flash_calls"]
+    fallback = stats["fallback_triton_calls"] + stats["fallback_torch_calls"]
+    lines = [
+        "=" * 70,
+        "ATTENTION DISPATCH SUMMARY",
+        "=" * 70,
+        f"Flash enabled:               {ENABLE_FLASH_ATTENTION}",
+        f"Total calls:                  {total}",
+        f"Flash calls:                  {flash}",
+        f"Fallback calls:               {fallback}",
+        f"  Triton fallback calls:      {stats['fallback_triton_calls']}",
+        f"  Torch fallback calls:       {stats['fallback_torch_calls']}",
+    ]
+    if total:
+        lines.append(f"Flash hit rate:               {100.0 * flash / total:.1f}%")
+    lines.extend(
+        [
+            "",
+            "Call categories:",
+            f"  causal:                     {stats['causal_calls']}",
+            f"  masked:                     {stats['masked_calls']}",
+            f"  gqa:                        {stats['gqa_calls']}",
+            f"  decode-like (q<k):         {stats['decode_like_calls']}",
+            "",
+            "Flash-covered categories:",
+            f"  causal:                     {stats['flash_causal_calls']}",
+            f"  masked:                     {stats['flash_masked_calls']}",
+            f"  gqa:                        {stats['flash_gqa_calls']}",
+            f"  decode-like (q<k):         {stats['flash_decode_like_calls']}",
+        ]
+    )
+    if stats["ineligible_reasons"]:
+        lines.extend(["", "Flash ineligible reasons:"])
+        for reason, count in sorted(
+            stats["ineligible_reasons"].items(), key=lambda item: (-item[1], item[0])
+        ):
+            lines.append(f"  {reason:<28} {count}")
+    if stats["shape_counts"]:
+        lines.extend(["", f"Top {min(top_n_shapes, len(stats['shape_counts']))} shapes:"])
+        for shape_key, count in sorted(
+            stats["shape_counts"].items(), key=lambda item: (-item[1], item[0])
+        )[:top_n_shapes]:
+            lines.append(f"  {shape_key:<48} {count}")
+    return "\n".join(lines)
+
+
+def _record_attention_shape(
+    head_dim: int,
+    seq_q: int,
+    seq_k: int,
+    num_heads: int,
+    num_kv_heads: int,
+    is_causal: bool,
+    has_mask: bool,
+):
+    """Record a compact shape signature for benchmark/path analysis."""
+    shape_key = (
+        f"hd={head_dim}|q={seq_q}|k={seq_k}|h={num_heads}|kv={num_kv_heads}|"
+        f"causal={int(is_causal)}|mask={int(has_mask)}"
+    )
+    _ATTENTION_PROFILE_STATS["shape_counts"][shape_key] += 1
 
 
 # ============================================================================
@@ -557,23 +674,41 @@ def _can_use_flash_attention(
     is_causal: bool,
 ) -> bool:
     """Return whether the fused flash path can handle this call."""
+    return (
+        _flash_attention_ineligibility_reason(q, k, v, attention_mask, is_causal)
+        is None
+    )
+
+
+def _flash_attention_ineligibility_reason(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    is_causal: bool,
+) -> Optional[str]:
+    """Return None if flash is usable, otherwise a compact reason string."""
+    if not ENABLE_FLASH_ATTENTION:
+        return "flash_disabled"
     if not (q.is_cuda and k.is_cuda and v.is_cuda):
-        return False
+        return "non_cuda_inputs"
     if q.shape[-1] not in FLASH_ATTENTION_CONFIGS:
-        return False
+        return "head_dim_unsupported"
     if q.shape[-1] != k.shape[-1] or q.shape[-1] != v.shape[-1]:
-        return False
+        return "head_dim_mismatch"
     if q.shape[0] != k.shape[0] or q.shape[0] != v.shape[0]:
-        return False
+        return "batch_mismatch"
     if k.shape[1] != v.shape[1]:
-        return False
+        return "kv_head_mismatch"
     if q.shape[1] % k.shape[1] != 0:
-        return False
+        return "gqa_ratio_invalid"
     if q.shape[-2] == 0 or k.shape[-2] == 0:
-        return False
+        return "empty_sequence"
     if is_causal and q.shape[-2] > k.shape[-2]:
-        return False
-    return True
+        return "causal_q_gt_k"
+    if attention_mask is not None and attention_mask.ndim != 3:
+        return "mask_not_normalized"
+    return None
 
 
 def _flash_scaled_dot_product_attention(
@@ -654,7 +789,27 @@ def scaled_dot_product_attention(
     Scaled dot-product attention using Triton kernels.
     """
     batch, num_heads, seq_q, head_dim = q.shape
-    _, _, seq_k, _ = k.shape
+    _, num_kv_heads, seq_k, _ = k.shape
+    has_mask = attention_mask is not None
+
+    _ATTENTION_PROFILE_STATS["total_calls"] += 1
+    if is_causal:
+        _ATTENTION_PROFILE_STATS["causal_calls"] += 1
+    if has_mask:
+        _ATTENTION_PROFILE_STATS["masked_calls"] += 1
+    if num_kv_heads != num_heads:
+        _ATTENTION_PROFILE_STATS["gqa_calls"] += 1
+    if seq_q < seq_k:
+        _ATTENTION_PROFILE_STATS["decode_like_calls"] += 1
+    _record_attention_shape(
+        head_dim,
+        seq_q,
+        seq_k,
+        num_heads,
+        num_kv_heads,
+        is_causal,
+        has_mask,
+    )
 
     if scale is None:
         scale = 1.0 / np.sqrt(head_dim)
@@ -668,18 +823,35 @@ def scaled_dot_product_attention(
         q.device,
     )
 
-    if ENABLE_FLASH_ATTENTION and (
-        attention_mask is None or normalized_attention_mask is not None
-    ):
-        if _can_use_flash_attention(q, k, v, normalized_attention_mask, is_causal):
-            return _flash_scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                float(scale),
-                is_causal,
-                attention_mask=normalized_attention_mask,
-            )
+    flash_ineligible_reason = None
+    if not ENABLE_FLASH_ATTENTION:
+        flash_ineligible_reason = "flash_disabled"
+    elif has_mask and normalized_attention_mask is None:
+        flash_ineligible_reason = "unsupported_attention_mask_shape"
+    else:
+        flash_ineligible_reason = _flash_attention_ineligibility_reason(
+            q, k, v, normalized_attention_mask, is_causal
+        )
+
+    if flash_ineligible_reason is None:
+        _ATTENTION_PROFILE_STATS["flash_calls"] += 1
+        if is_causal:
+            _ATTENTION_PROFILE_STATS["flash_causal_calls"] += 1
+        if has_mask:
+            _ATTENTION_PROFILE_STATS["flash_masked_calls"] += 1
+        if num_kv_heads != num_heads:
+            _ATTENTION_PROFILE_STATS["flash_gqa_calls"] += 1
+        if seq_q < seq_k:
+            _ATTENTION_PROFILE_STATS["flash_decode_like_calls"] += 1
+        return _flash_scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            float(scale),
+            is_causal,
+            attention_mask=normalized_attention_mask,
+        )
+    _ATTENTION_PROFILE_STATS["ineligible_reasons"][flash_ineligible_reason] += 1
 
     if k.shape[1] != q.shape[1]:
         if q.shape[1] % k.shape[1] != 0:
@@ -701,6 +873,7 @@ def scaled_dot_product_attention(
     )
 
     if use_triton:
+        _ATTENTION_PROFILE_STATS["fallback_triton_calls"] += 1
         q_flat = q.reshape(batch * num_heads, seq_q, head_dim).to(torch.float32)
         k_flat = k.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32)
         v_flat = v.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32)
@@ -809,6 +982,7 @@ def scaled_dot_product_attention(
 
         return output.reshape(batch, num_heads, seq_q, head_dim).to(q.dtype)
 
+    _ATTENTION_PROFILE_STATS["fallback_torch_calls"] += 1
     scores = torch.einsum("bnqd,bnkd->bnqk", q, k) * scale
 
     if is_causal:
@@ -952,5 +1126,6 @@ if __name__ == "__main__":
     _assert_attention_close("gqa_decode_like_causal", actual, expected)
 
     print("\nAll Triton attention reference checks passed.")
+    print("\n" + format_attention_profile_stats())
 
     print("\nTriton Attention working!")

@@ -10,6 +10,7 @@ Usage:
 """
 
 import argparse
+import importlib
 import time
 import sys
 import os
@@ -62,6 +63,36 @@ class TorchTimer:
             return self.start_event.elapsed_time(self.end_event)
         elapsed = (time.perf_counter() - self._start_time) * 1000
         return elapsed
+
+
+def _reset_optional_profile_stats():
+    """Reset optional dispatch statistics exposed by student modules."""
+    for module_name, reset_name in (
+        ("attention", "reset_attention_profile_stats"),
+        ("layers", "reset_layer_profile_stats"),
+    ):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            continue
+        reset_fn = getattr(module, reset_name, None)
+        if callable(reset_fn):
+            reset_fn()
+
+
+def _print_optional_profile_stats():
+    """Print optional dispatch statistics exposed by student modules."""
+    for module_name, format_name in (
+        ("attention", "format_attention_profile_stats"),
+        ("layers", "format_layer_profile_stats"),
+    ):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            continue
+        format_fn = getattr(module, format_name, None)
+        if callable(format_fn):
+            print("\n" + format_fn())
 
 
 
@@ -507,6 +538,7 @@ def main():
         print(f"Input features shape: {input_features.shape}")
         print(f"Input IDs shape: {input_ids.shape}")
 
+        _reset_optional_profile_stats()
         component_results = detailed_profile_torch(model, input_features, input_ids, input_features_mask, num_runs=args.runs)
     else:
         import cupy as cp
@@ -526,10 +558,12 @@ def main():
         print(f"Input features shape: {input_features.shape}")
         print(f"Input IDs shape: {input_ids.shape}")
 
+        _reset_optional_profile_stats()
         component_results = detailed_profile(model, input_features, input_ids, input_features_mask, num_runs=args.runs)
 
     # Print summary
     print_summary(component_results)
+    _print_optional_profile_stats()
 
     sys.path.remove(folder_path)
     return 0
