@@ -303,6 +303,7 @@ def next_power_of_two(x: int) -> int:
 
 
 MAX_ATTENTION_DIM = 256
+ENABLE_FLASH_ATTENTION = True
 FLASH_ATTENTION_CONFIGS = {
     64: {"block_m": 32, "block_n": 64, "num_warps": 4, "num_stages": 2},
     128: {"block_m": 32, "block_n": 64, "num_warps": 8, "num_stages": 2},
@@ -667,7 +668,9 @@ def scaled_dot_product_attention(
         q.device,
     )
 
-    if attention_mask is None or normalized_attention_mask is not None:
+    if ENABLE_FLASH_ATTENTION and (
+        attention_mask is None or normalized_attention_mask is not None
+    ):
         if _can_use_flash_attention(q, k, v, normalized_attention_mask, is_causal):
             return _flash_scaled_dot_product_attention(
                 q,
@@ -838,6 +841,7 @@ if __name__ == "__main__":
 
     print(f"  Device: {device}")
     print(f"  Seed:   {seed}")
+    print(f"  Flash:  {ENABLE_FLASH_ATTENTION}")
 
     batch_size = 2
     num_heads = 4
