@@ -92,6 +92,22 @@ def compute_freqs_kernel(
         mask=mask,
     )
     #pass
+    pid = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    mask = offs < half_dim
+
+    # Load the current position (scalar)
+    pos = tl.load(positions_ptr + pid * stride_pos)
+    # Load inverse frequencies (vector)
+    inv = tl.load(inv_freq_ptr + offs * stride_inv, mask=mask, other=0.0)
+    freqs = pos * inv
+    cos_half = tl.cos(freqs)
+    sin_half = tl.sin(freqs)
+    # Store the computed cos and sin values in the output buffers
+    tl.store(cos_ptr + pid * stride_cos0 + offs * stride_cos1, cos_half, mask=mask)
+    tl.store(cos_ptr + pid * stride_cos0 + (offs + half_dim) * stride_cos1, cos_half, mask=mask)
+    tl.store(sin_ptr + pid * stride_sin0 + offs * stride_sin1, sin_half, mask=mask)
+    tl.store(sin_ptr + pid * stride_sin0 + (offs + half_dim) * stride_sin1, sin_half, mask=mask)
 
 
 # ============================================================================
